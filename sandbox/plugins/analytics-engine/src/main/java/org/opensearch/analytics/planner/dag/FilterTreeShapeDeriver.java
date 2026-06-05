@@ -58,17 +58,24 @@ final class FilterTreeShapeDeriver {
      *
      * @param filter              the OpenSearchFilter with annotations intact
      * @param drivingBackendId    the filter operator's resolved backend
+     * @param fuseDualViable      mirrors the {@code analytics.delegation.fuse_dual_viable} cluster
+     *                            setting. When {@code true}, the combiner fuses OR-of-same-backend
+     *                            delegated leaves into a single {@code delegated_predicate} call
+     *                            wrapping the OR; the post-combiner tree the data node sees is
+     *                            conjunctive (one delegated scalar at the top level). This deriver
+     *                            walks the pre-combiner condition, so it must mirror that fusion
+     *                            to keep the data-node evaluator path classification consistent.
      * @return the tree shape, or {@code null} if no delegated annotations exist
      */
-    static FilterTreeShape derive(OpenSearchFilter filter, String drivingBackendId) {
-        Result result = walk(filter.getCondition(), drivingBackendId);
+    static FilterTreeShape derive(OpenSearchFilter filter, String drivingBackendId, boolean fuseDualViable) {
+        Result result = walk(filter.getCondition(), drivingBackendId, fuseDualViable);
         if (!result.hasDelegated) {
             return FilterTreeShape.NO_DELEGATION;
         }
         return result.hasMixed ? FilterTreeShape.INTERLEAVED_BOOLEAN_EXPRESSION : FilterTreeShape.CONJUNCTIVE;
     }
 
-    private static Result walk(RexNode node, String drivingBackendId) {
+    private static Result walk(RexNode node, String drivingBackendId, boolean fuseDualViable) {
         if (node instanceof AnnotatedPredicate predicate) {
             // Two flavors of delegation count toward "hasDelegated":
             // 1. Correctness — viableBackends differs from operator backend (the only backend
@@ -78,36 +85,38 @@ final class FilterTreeShapeDeriver {
             boolean isCorrectness = !predicate.getViableBackends().getFirst().equals(drivingBackendId);
             boolean isPerformance = !predicate.getPerformanceDelegationBackends().isEmpty();
             boolean isDelegated = isCorrectness || isPerformance;
-            return new Result(isDelegated, false, !isDelegated);
+            return new Result(isDelegated, false, !isDelegated, isPerformance);
         }
         if (node instanceof RexCall call) {
             boolean isOrNot = call.getKind() == SqlKind.OR || call.getKind() == SqlKind.NOT;
 
             boolean hasDelegated = false;
             boolean hasDrivingBackend = false;
+            boolean hasPerformanceDelegation = false;
             boolean hasMixed = false;
 
             for (RexNode operand : call.getOperands()) {
-                Result childResult = walk(operand, drivingBackendId);
+                Result childResult = walk(operand, drivingBackendId, fuseDualViable);
                 hasDelegated |= childResult.hasDelegated;
                 hasDrivingBackend |= childResult.hasDrivingBackend;
                 hasMixed |= childResult.hasMixed;
+                hasPerformanceDelegation |= childResult.hasPerformanceDelegation;
             }
 
-            // A delegated predicate under OR or NOT requires the tree evaluator —
-            // NOT(delegated) needs bitmap inversion which SingleCollector can't do,
-            // and OR(delegated, ...) needs multi-collector bitmap combination.
-            // Previously this also required hasDrivingBackend, which missed the
-            // bare NOT(delegated) case where no driving-backend predicate exists.
-            if (isOrNot && hasDelegated) {
-                hasMixed = true;
-            }
+            // Under OR/NOT, interleaving occurs when delegated children sit alongside something
+            // the combiner can't fuse with them:
+            // - native (driving-backend) operands — never fuse, always interleaved.
+            // - performance-delegated operands — interleaved only when fuseDualViable is off
+            // (carve-out throws perf back to native individually); with fusion on the
+            // combiner emits a single delegation_possible wrapping the whole OR/NOT.
+            boolean unfuseablePeer = hasDrivingBackend || (hasPerformanceDelegation && fuseDualViable == false);
+            hasMixed |= isOrNot && hasDelegated && unfuseablePeer;
 
-            return new Result(hasDelegated, hasMixed, hasDrivingBackend);
+            return new Result(hasDelegated, hasMixed, hasDrivingBackend, hasPerformanceDelegation);
         }
-        return new Result(false, false, false);
+        return new Result(false, false, false, false);
     }
 
-    private record Result(boolean hasDelegated, boolean hasMixed, boolean hasDrivingBackend) {
+    private record Result(boolean hasDelegated, boolean hasMixed, boolean hasDrivingBackend, boolean hasPerformanceDelegation) {
     }
 }
